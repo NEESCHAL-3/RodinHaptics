@@ -216,3 +216,38 @@ source files. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 ## Maintainer
 
 **NEESCHAL**
+
+## Taking RodinHaptics Further
+
+RodinHaptics v1.0.0 provides a tested source implementation for `rodin`, but it is intentionally open for further development.
+
+Developers are welcome to fork the project, experiment, submit pull requests, or integrate only the parts useful for their ROM/device tree.
+
+Some possible areas for future work:
+
+- True native double-click sequencing.
+- AIDL composition and primitive support.
+- Better synchronization/thread-safety around short waveform translation.
+- Additional calibrated haptic profiles.
+- Per-ROM tuning and framework integration.
+- More extensive automated HAL tests.
+- Validation across additional Android/AOSP versions.
+- Further cleanup or abstraction for reuse on related MediaTek/Xiaomi devices.
+
+Please keep hardware-specific changes well documented and avoid replacing tested `rodin` behavior without validation on a real device.
+
+If you improve RodinHaptics, pull requests and technical discussion are welcome.
+
+## Contributing
+
+Contributions are welcome.
+
+When submitting changes, please include:
+
+- What was changed.
+- Why the change is needed.
+- Device and ROM used for testing.
+- Whether the change affects `perform()`, `on()`, amplitude handling, or generic vibration behavior.
+- Real-device validation results.
+
+Please avoid submitting untested tuning values or changes based only on theoretical Linux FF behavior. `si_haptic` behavior on `rodin` should be verified on actual hardware.
