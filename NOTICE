@@ -1,0 +1,12 @@
+RodinHaptics
+============
+
+RodinHaptics is a rodin-specific Android vibrator HAL adaptation maintained by
+NEESCHAL.
+
+The implementation is derived from the Qualcomm / The Linux Foundation AIDL
+vibrator service shipped for rodin. Original copyright and BSD-3-Clause terms
+are retained in the source files.
+
+No proprietary firmware, kernel object, vendor blob, or prebuilt binary is
+included in this source release.

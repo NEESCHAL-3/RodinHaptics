@@ -1,0 +1,7 @@
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 4
+ContinuationIndentWidth: 8
+PointerAlignment: Left
+DerivePointerAlignment: false
+SortIncludes: false

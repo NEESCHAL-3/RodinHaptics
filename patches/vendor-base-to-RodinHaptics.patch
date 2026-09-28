@@ -1,0 +1,865 @@
+diff --git a/Android.bp b/Android.bp
+index 03ab7fd..82a2ff8 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -2,21 +2,22 @@ cc_binary {
+     name: "vendor.qti.hardware.vibrator.service.rodin",
+     vendor: true,
+     relative_install_path: "hw",
++    cpp_std: "c++17",
++
+     init_rc: ["vendor.qti.hardware.vibrator.service.rodin.rc"],
+-    vintf_fragments: [
+-        "vendor.qti.hardware.vibrator.service.rodin.xml",
++    vintf_fragments: ["vendor.qti.hardware.vibrator.service.rodin.xml"],
++
++    srcs: [
++        "service.cpp",
++        "Vibrator.cpp",
+     ],
++
+     cflags: [
+         "-Wall",
+         "-Werror",
+     ],
+-    srcs: [
+-        "service.cpp",
+-        "Vibrator.cpp",
+-    ],
++
+     shared_libs: [
+-        "libcutils",
+-        "libutils",
+         "libbase",
+         "libbinder_ndk",
+         "liblog",
+diff --git a/Vibrator.cpp b/Vibrator.cpp
+index e535373..6797a81 100644
+--- a/Vibrator.cpp
++++ b/Vibrator.cpp
+@@ -25,163 +25,192 @@
+  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * RodinHaptics modifications Copyright (c) 2026 NEESCHAL.
+  */
+ 
+-#define LOG_TAG "vendor.qti.vibrator"
++#define LOG_TAG "RodinHaptics"
+ 
+-#include <cutils/properties.h>
+ #include <dirent.h>
+-#include <inttypes.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
+ #include <linux/input.h>
+ #include <log/log.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#include <unistd.h>
++
+ #include <thread>
+ 
+ #include "Vibrator.h"
+ 
+-namespace aidl {
+-namespace android {
+-namespace hardware {
+-namespace vibrator {
++namespace aidl::android::hardware::vibrator {
++namespace {
++
++constexpr int32_t kStrongMagnitude = 0xafff;
++constexpr int32_t kMediumMagnitude = 0x8fff;
++constexpr int32_t kLightMagnitude = 0x5fff;
++constexpr int32_t kMinGenericMagnitude = 0x0800;
++
++constexpr int kInvalidValue = -1;
++constexpr int kCustomDataLen = 3;
++constexpr int kNameBufferSize = 32;
++
++constexpr int kTinyTouchMaxDurationMs = 10;
++constexpr int kShortAccentMaxDurationMs = 40;
++constexpr int kShortUiMaxDurationMs = 80;
++constexpr int kUiReferenceAmplitude = 13;
++
++// Native si_haptic firmware effect IDs validated on rodin.
++constexpr int kNativeClick = 7;
++constexpr int kNativeDoubleClick = 8;
++constexpr int kNativeTick = 7;
++constexpr int kNativeThud = 6;
++constexpr int kNativePop = 9;
++constexpr int kNativeHeavyClick = 6;
++
++bool testBit(int bit, const uint8_t* array) {
++    return array[bit / 8] & (1U << (bit % 8));
++}
++
++bool isSupportedHapticDevice(const char* name) {
++    return strcmp(name, "qcom-hv-haptics") == 0 ||
++           strcmp(name, "qti-haptics") == 0 ||
++           strcmp(name, "aw8697_haptic") == 0 ||
++           strcmp(name, "awinic_haptic") == 0 ||
++           strcmp(name, "si_haptic") == 0;
++}
+ 
+-#define STRONG_MAGNITUDE        0x7fff
+-#define MEDIUM_MAGNITUDE        0x5fff
+-#define LIGHT_MAGNITUDE         0x3fff
+-#define INVALID_VALUE           -1
+-#define CUSTOM_DATA_LEN         3
+-#define NAME_BUF_SIZE           32
++int toNativeEffectId(Effect effect) {
++    switch (effect) {
++        case Effect::CLICK:
++            return kNativeClick;
++        case Effect::DOUBLE_CLICK:
++            return kNativeDoubleClick;
++        case Effect::TICK:
++            return kNativeTick;
++        case Effect::THUD:
++            return kNativeThud;
++        case Effect::POP:
++            return kNativePop;
++        case Effect::HEAVY_CLICK:
++            return kNativeHeavyClick;
++        default:
++            return kInvalidValue;
++    }
++}
+ 
+-#define test_bit(bit, array)    ((array)[(bit)/8] & (1<<((bit)%8)))
++}  // namespace
+ 
+ InputFFDevice::InputFFDevice()
+-{
+-    DIR *dp;
+-    struct dirent *dir;
+-    uint8_t ffBitmask[FF_CNT / 8];
++    : mSupportGain(false),
++      mSupportEffects(false),
++      mVibraFd(kInvalidValue),
++      mCurrAppId(kInvalidValue),
++      mCurrMagnitude(kMediumMagnitude),
++      mUiPulseMode(false),
++      mUiAmplitudeLatched(false),
++      mUiBaseMagnitude(kMediumMagnitude) {
++    DIR* dp;
++    struct dirent* dir;
++    uint8_t ffBitmask[(FF_CNT + 7) / 8] = {};
+     char devicename[PATH_MAX];
+-    const char *INPUT_DIR = "/dev/input/";
+-    char name[NAME_BUF_SIZE];
+-    int fd, ret;
+-
+-    mVibraFd = INVALID_VALUE;
+-    mSupportGain = false;
+-    mSupportEffects = false;
+-    mCurrAppId = INVALID_VALUE;
+-    mCurrMagnitude = 0x7fff;
+-
+-    dp = opendir(INPUT_DIR);
+-    if (!dp) {
+-        ALOGE("open %s failed, errno = %d", INPUT_DIR, errno);
++    constexpr char kInputDir[] = "/dev/input/";
++    char name[kNameBufferSize] = {};
++
++    dp = opendir(kInputDir);
++    if (dp == nullptr) {
++        ALOGE("Failed to open %s: %s", kInputDir, strerror(errno));
+         return;
+     }
+ 
+-    memset(ffBitmask, 0, sizeof(ffBitmask));
+-    while ((dir = readdir(dp)) != NULL){
++    while ((dir = readdir(dp)) != nullptr) {
+         if (dir->d_name[0] == '.' &&
+             (dir->d_name[1] == '\0' ||
+-             (dir->d_name[1] == '.' && dir->d_name[2] == '\0')))
++             (dir->d_name[1] == '.' && dir->d_name[2] == '\0'))) {
+             continue;
++        }
+ 
+-        snprintf(devicename, PATH_MAX, "%s%s", INPUT_DIR, dir->d_name);
+-        fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
++        snprintf(devicename, sizeof(devicename), "%s%s", kInputDir, dir->d_name);
++        const int fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
+         if (fd < 0) {
+-            ALOGE("open %s failed, errno = %d", devicename, errno);
+             continue;
+         }
+ 
+-        ret = TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGNAME(sizeof(name)), name));
+-        if (ret == -1) {
+-            ALOGE("get input device name %s failed, errno = %d\n", devicename, errno);
++        memset(name, 0, sizeof(name));
++        if (TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGNAME(sizeof(name)), name)) == -1) {
+             close(fd);
+             continue;
+         }
+ 
+-        if (strcmp(name, "qcom-hv-haptics") && strcmp(name, "qti-haptics")
+-            && strcmp(name, "aw8697_haptic")
+-            && strcmp(name, "awinic_haptic")
+-            && strcmp(name, "si_haptic")) {
+-            ALOGD("not a qcom/qti haptics device\n");
++        if (!isSupportedHapticDevice(name)) {
+             close(fd);
+             continue;
+         }
+ 
+-        ALOGI("%s is detected at %s\n", name, devicename);
+-        ret = TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffBitmask)), ffBitmask));
+-        if (ret == -1) {
+-            ALOGE("ioctl failed, errno = %d", errno);
++        memset(ffBitmask, 0, sizeof(ffBitmask));
++        if (TEMP_FAILURE_RETRY(ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffBitmask)), ffBitmask)) == -1) {
++            ALOGE("EVIOCGBIT failed for %s: %s", devicename, strerror(errno));
+             close(fd);
+             continue;
+         }
+ 
+-        if (test_bit(FF_CONSTANT, ffBitmask) ||
+-                test_bit(FF_PERIODIC, ffBitmask)) {
+-            mVibraFd = fd;
+-            if (test_bit(FF_CUSTOM, ffBitmask))
+-                mSupportEffects = true;
+-            if (test_bit(FF_GAIN, ffBitmask))
+-                mSupportGain = true;
+-            break;
++        if (!testBit(FF_CONSTANT, ffBitmask) && !testBit(FF_PERIODIC, ffBitmask)) {
++            close(fd);
++            continue;
+         }
+ 
+-        close(fd);
++        mVibraFd = fd;
++        mSupportEffects = testBit(FF_CUSTOM, ffBitmask);
++        mSupportGain = testBit(FF_GAIN, ffBitmask);
++        ALOGI("Using haptic input device %s (%s)", name, devicename);
++        break;
+     }
+ 
+     closedir(dp);
+ }
+ 
+-/** Play vibration
+- *
+- *  @param effectId:  ID of the predefined effect will be played. If effectId is valid
+- *                    (non-negative value), the timeoutMs value will be ignored, and the
+- *                    real playing length will be set in param@playLengtMs and returned
+- *                    to VibratorService. If effectId is invalid, value in param@timeoutMs
+- *                    will be used as the play length for playing a constant effect.
+- *  @param timeoutMs: playing length, non-zero means playing, zero means stop playing.
+- *  @param playLengthMs: the playing length in ms unit which will be returned to
+- *                    VibratorService if the request is playing a predefined effect.
+- *                    The custom_data in periodic is reused for returning the playLengthMs
+- *                    from kernel space to userspace if the pattern is defined in kernel
+- *                    driver. It's been defined with following format:
+- *                       <effect-ID, play-time-in-seconds, play-time-in-milliseconds>.
+- *                    The effect-ID is used for passing down the predefined effect to
+- *                    kernel driver, and the rest two parameters are used for returning
+- *                    back the real playing length from kernel driver.
+- */
+-int InputFFDevice::play(int effectId, uint32_t timeoutMs, long *playLengthMs) {
+-    struct ff_effect effect;
+-    struct input_event play;
+-    int16_t data[CUSTOM_DATA_LEN] = {0, 0, 0};
++int InputFFDevice::play(int effectId, uint32_t timeoutMs, long* playLengthMs) {
++    struct ff_effect effect = {};
++    struct input_event play = {};
++    int16_t data[kCustomDataLen] = {0, 0, 0};
+     int ret;
+ 
+-    /* For QMAA compliance, return OK even if vibrator device doesn't exist */
+-    if (mVibraFd == INVALID_VALUE) {
+-        if (playLengthMs != NULL)
++    // Preserve the stock QMAA behavior: absence of a vibrator device is not a
++    // service-level error.
++    if (mVibraFd == kInvalidValue) {
++        if (playLengthMs != nullptr) {
+             *playLengthMs = 0;
++        }
+         return 0;
+     }
+ 
+     if (timeoutMs != 0) {
+-        if (mCurrAppId != INVALID_VALUE) {
++        if (mCurrAppId != kInvalidValue) {
+             ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCRMFF, mCurrAppId));
+             if (ret == -1) {
+-                ALOGE("ioctl EVIOCRMFF failed, errno = %d", -errno);
+-                goto errout;
++                ALOGE("EVIOCRMFF failed: %s", strerror(errno));
++                goto error;
+             }
+-            mCurrAppId = INVALID_VALUE;
++            mCurrAppId = kInvalidValue;
+         }
+ 
+-        memset(&effect, 0, sizeof(effect));
+-        if (effectId != INVALID_VALUE) {
+-            data[0] = effectId;
++        if (effectId != kInvalidValue) {
++            data[0] = static_cast<int16_t>(effectId);
+             effect.type = FF_PERIODIC;
+             effect.u.periodic.waveform = FF_CUSTOM;
+-            effect.u.periodic.magnitude = mCurrMagnitude;
++
++            // The rodin si_haptic driver consumes the raw 16-bit magnitude
++            // pattern in this field. Values above 0x7fff are intentional and
++            // match the hand-validated RodinHaptics calibration.
++            effect.u.periodic.magnitude = static_cast<int16_t>(mCurrMagnitude);
+             effect.u.periodic.custom_data = data;
+-            effect.u.periodic.custom_len = sizeof(int16_t) * CUSTOM_DATA_LEN;
++            effect.u.periodic.custom_len = sizeof(data);
+         } else {
+             effect.type = FF_CONSTANT;
+-            effect.u.constant.level = mCurrMagnitude;
++            effect.u.constant.level = static_cast<int16_t>(mCurrMagnitude);
+             effect.replay.length = timeoutMs;
+         }
+ 
+@@ -190,134 +219,186 @@ int InputFFDevice::play(int effectId, uint32_t timeoutMs, long *playLengthMs) {
+ 
+         ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCSFF, &effect));
+         if (ret == -1) {
+-            ALOGE("ioctl EVIOCSFF failed, errno = %d", -errno);
+-            goto errout;
++            ALOGE("EVIOCSFF failed: %s", strerror(errno));
++            goto error;
+         }
+ 
+         mCurrAppId = effect.id;
+-        if (effectId != INVALID_VALUE && playLengthMs != NULL) {
+-            *playLengthMs = data[1] * 1000 + data[2];
++        if (effectId != kInvalidValue && playLengthMs != nullptr) {
++            *playLengthMs = data[1] * 1000L + data[2];
+         }
+ 
+-        play.value = 1;
+         play.type = EV_FF;
+         play.code = mCurrAppId;
+-        play.time.tv_sec = 0;
+-        play.time.tv_usec = 0;
+-        ret = TEMP_FAILURE_RETRY(write(mVibraFd, (const void*)&play, sizeof(play)));
++        play.value = 1;
++        ret = TEMP_FAILURE_RETRY(write(mVibraFd, &play, sizeof(play)));
+         if (ret == -1) {
+-            ALOGE("write failed, errno = %d\n", -errno);
+-            ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCRMFF, mCurrAppId));
+-            if (ret == -1)
+-                ALOGE("ioctl EVIOCRMFF failed, errno = %d", -errno);
+-            goto errout;
++            ALOGE("Failed to start force-feedback effect: %s", strerror(errno));
++            TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCRMFF, mCurrAppId));
++            goto error;
+         }
+-    } else if (mCurrAppId != INVALID_VALUE) {
++    } else if (mCurrAppId != kInvalidValue) {
+         ret = TEMP_FAILURE_RETRY(ioctl(mVibraFd, EVIOCRMFF, mCurrAppId));
+         if (ret == -1) {
+-            ALOGE("ioctl EVIOCRMFF failed, errno = %d", -errno);
+-            goto errout;
++            ALOGE("EVIOCRMFF failed: %s", strerror(errno));
++            goto error;
+         }
+-        mCurrAppId = INVALID_VALUE;
++        mCurrAppId = kInvalidValue;
+     }
++
+     return 0;
+ 
+-errout:
+-    mCurrAppId = INVALID_VALUE;
++error:
++    mCurrAppId = kInvalidValue;
+     return ret;
+ }
+ 
+ int InputFFDevice::on(int32_t timeoutMs) {
+-    return play(INVALID_VALUE, timeoutMs, NULL);
++    long duration = 0;
++
++    // Short Android UI waveforms sound cleaner on rodin when translated to
++    // the actuator's native firmware effects instead of FF_CONSTANT.
++    if (mSupportEffects && timeoutMs > 0 && timeoutMs <= kShortUiMaxDurationMs) {
++        int effectId;
++
++        if (timeoutMs <= kTinyTouchMaxDurationMs) {
++            effectId = kNativeTick;
++            mUiBaseMagnitude = kLightMagnitude;
++        } else if (timeoutMs <= kShortAccentMaxDurationMs) {
++            effectId = kNativeDoubleClick;
++            mUiBaseMagnitude = kMediumMagnitude;
++        } else {
++            effectId = kNativeTick;
++            mUiBaseMagnitude = kLightMagnitude;
++        }
++
++        mUiPulseMode = true;
++        mUiAmplitudeLatched = false;
++        mCurrMagnitude = mUiBaseMagnitude;
++        return play(effectId, kInvalidValue, &duration);
++    }
++
++    mUiPulseMode = false;
++    mUiAmplitudeLatched = false;
++    return play(kInvalidValue, timeoutMs, nullptr);
+ }
+ 
+ int InputFFDevice::off() {
+-    return play(INVALID_VALUE, 0, NULL);
++    mUiPulseMode = false;
++    mUiAmplitudeLatched = false;
++    return play(kInvalidValue, 0, nullptr);
+ }
+ 
+-int InputFFDevice::setAmplitude(uint8_t amplitude) {
+-    int tmp, ret;
+-    struct input_event ie;
++int InputFFDevice::writeGain(int32_t magnitude) {
++    struct input_event event = {};
++    event.type = EV_FF;
++    event.code = FF_GAIN;
++    event.value = magnitude;
++
++    const int ret = TEMP_FAILURE_RETRY(write(mVibraFd, &event, sizeof(event)));
++    if (ret == -1) {
++        ALOGE("Failed to write FF_GAIN: %s", strerror(errno));
++        return ret;
++    }
++
++    mCurrMagnitude = magnitude;
++    return 0;
++}
+ 
+-    /* For QMAA compliance, return OK even if vibrator device doesn't exist */
+-    if (mVibraFd == INVALID_VALUE)
++int InputFFDevice::setAmplitude(uint8_t amplitude) {
++    if (mVibraFd == kInvalidValue) {
+         return 0;
++    }
+ 
+-    tmp = amplitude * (STRONG_MAGNITUDE - LIGHT_MAGNITUDE) / 255;
+-    tmp += LIGHT_MAGNITUDE;
+-    ie.type = EV_FF;
+-    ie.code = FF_GAIN;
+-    ie.value = tmp;
++    if (mUiPulseMode) {
++        // Android's first amplitude point selects the strength for the native
++        // pulse. Later envelope points are intentionally ignored; replaying
++        // them through FF_GAIN makes the actuator feel buzzy instead of crisp.
++        if (mUiAmplitudeLatched) {
++            return 0;
++        }
+ 
+-    ret = TEMP_FAILURE_RETRY(write(mVibraFd, &ie, sizeof(ie)));
+-    if (ret == -1) {
+-        ALOGE("write FF_GAIN failed, errno = %d", -errno);
++        int32_t magnitude =
++                (mUiBaseMagnitude * static_cast<int32_t>(amplitude) * 3 +
++                 kUiReferenceAmplitude) /
++                (kUiReferenceAmplitude * 2);
++
++        if (magnitude < kMinGenericMagnitude) {
++            magnitude = kMinGenericMagnitude;
++        } else if (magnitude > kStrongMagnitude) {
++            magnitude = kStrongMagnitude;
++        }
++
++        const int ret = writeGain(magnitude);
++        if (ret == 0) {
++            mUiAmplitudeLatched = true;
++        }
+         return ret;
+     }
+ 
+-    mCurrMagnitude = tmp;
+-    return 0;
++    // Generic/long waveforms remain generic. This intentionally preserves
++    // Android's existing notification, ringtone and application timing.
++    int32_t magnitude =
++            static_cast<int32_t>(amplitude) * kStrongMagnitude / 255;
++    if (magnitude < kMinGenericMagnitude) {
++        magnitude = kMinGenericMagnitude;
++    }
++
++    return writeGain(magnitude);
+ }
+ 
+-int InputFFDevice::playEffect(int effectId, EffectStrength es, long *playLengthMs) {
+-    switch (es) {
+-    case EffectStrength::LIGHT:
+-        mCurrMagnitude = LIGHT_MAGNITUDE;
+-        break;
+-    case EffectStrength::MEDIUM:
+-        mCurrMagnitude = MEDIUM_MAGNITUDE;
+-        break;
+-    case EffectStrength::STRONG:
+-        mCurrMagnitude = STRONG_MAGNITUDE;
+-        break;
+-    default:
+-        return -1;
++int InputFFDevice::playEffect(int effectId, EffectStrength strength, long* playLengthMs) {
++    mUiPulseMode = false;
++    mUiAmplitudeLatched = false;
++
++    switch (strength) {
++        case EffectStrength::LIGHT:
++            mCurrMagnitude = kLightMagnitude;
++            break;
++        case EffectStrength::MEDIUM:
++            mCurrMagnitude = kMediumMagnitude;
++            break;
++        case EffectStrength::STRONG:
++            mCurrMagnitude = kStrongMagnitude;
++            break;
++        default:
++            return -1;
+     }
+ 
+-    return play(effectId, INVALID_VALUE, playLengthMs);
++    return play(effectId, kInvalidValue, playLengthMs);
+ }
+ 
+ ndk::ScopedAStatus Vibrator::getCapabilities(int32_t* _aidl_return) {
+     *_aidl_return = IVibrator::CAP_ON_CALLBACK;
+ 
+-    if (ff.mSupportGain)
++    if (ff.mSupportGain) {
+         *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL;
+-    if (ff.mSupportEffects)
++    }
++    if (ff.mSupportEffects) {
+         *_aidl_return |= IVibrator::CAP_PERFORM_CALLBACK;
++    }
+ 
+-    ALOGD("QTI Vibrator reporting capabilities: %d", *_aidl_return);
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+ ndk::ScopedAStatus Vibrator::off() {
+-    int ret;
+-
+-    ALOGD("QTI Vibrator off");
+-
+-    ret = ff.off();
+-    if (ret != 0)
++    if (ff.off() != 0) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
+-
++    }
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+-ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
+-                                const std::shared_ptr<IVibratorCallback>& callback) {
+-    int ret;
+-
+-    ALOGD("Vibrator on for timeoutMs: %d", timeoutMs);
+-
+-    ret = ff.on(timeoutMs);
+-    if (ret != 0)
++ndk::ScopedAStatus Vibrator::on(
++        int32_t timeoutMs, const std::shared_ptr<IVibratorCallback>& callback) {
++    if (ff.on(timeoutMs) != 0) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
++    }
+ 
+     if (callback != nullptr) {
+-        std::thread([=] {
+-            ALOGD("Starting on on another thread");
++        std::thread([callback, timeoutMs] {
+             usleep(timeoutMs * 1000);
+-            ALOGD("Notifying on complete");
+             if (!callback->onComplete().isOk()) {
+-                ALOGE("Failed to call onComplete");
++                ALOGE("Failed to invoke on() completion callback");
+             }
+         }).detach();
+     }
+@@ -325,29 +406,30 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+-ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es, const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return) {
+-    long playLengthMs;
+-    int ret;
+-
+-    ALOGD("Vibrator perform effect %d", effect);
+-
+-    if (effect < Effect::CLICK ||
+-            effect > Effect::HEAVY_CLICK)
++ndk::ScopedAStatus Vibrator::perform(
++        Effect effect, EffectStrength strength,
++        const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return) {
++    const int nativeEffectId = toNativeEffectId(effect);
++    if (nativeEffectId == kInvalidValue) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
++    }
+ 
+-    if (es != EffectStrength::LIGHT && es != EffectStrength::MEDIUM && es != EffectStrength::STRONG)
++    if (strength != EffectStrength::LIGHT && strength != EffectStrength::MEDIUM &&
++        strength != EffectStrength::STRONG) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
++    }
+ 
+-    ret = ff.playEffect((static_cast<int>(effect)), es, &playLengthMs);
+-    if (ret != 0)
++    long playLengthMs = 0;
++    if (ff.playEffect(nativeEffectId, strength, &playLengthMs) != 0) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
++    }
+ 
+     if (callback != nullptr) {
+-        std::thread([=] {
+-            ALOGD("Starting perform on another thread");
++        std::thread([callback, playLengthMs] {
+             usleep(playLengthMs * 1000);
+-            ALOGD("Notifying perform complete");
+-            callback->onComplete();
++            if (!callback->onComplete().isOk()) {
++                ALOGE("Failed to invoke perform() completion callback");
++            }
+         }).detach();
+     }
+ 
+@@ -356,69 +438,64 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es, const std
+ }
+ 
+ ndk::ScopedAStatus Vibrator::getSupportedEffects(std::vector<Effect>* _aidl_return) {
+-    *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::TICK, Effect::THUD,
+-                     Effect::POP, Effect::HEAVY_CLICK};
+-
++    *_aidl_return = {Effect::CLICK, Effect::DOUBLE_CLICK, Effect::TICK,
++                     Effect::THUD, Effect::POP, Effect::HEAVY_CLICK};
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+ ndk::ScopedAStatus Vibrator::setAmplitude(float amplitude) {
+-    uint8_t tmp;
+-    int ret;
+-
+-    ALOGD("Vibrator set amplitude: %f", amplitude);
+-
+-    if (amplitude <= 0.0f || amplitude > 1.0f)
++    if (amplitude <= 0.0f || amplitude > 1.0f) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
++    }
+ 
+-    tmp = (uint8_t)(amplitude * 0xff);
+-    ret = ff.setAmplitude(tmp);
+-    if (ret != 0)
++    const auto scaledAmplitude = static_cast<uint8_t>(amplitude * 0xff);
++    if (ff.setAmplitude(scaledAmplitude) != 0) {
+         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
++    }
+ 
+     return ndk::ScopedAStatus::ok();
+ }
+ 
+-ndk::ScopedAStatus Vibrator::setExternalControl(bool enabled __unused) {
++ndk::ScopedAStatus Vibrator::setExternalControl(bool /* enabled */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::getCompositionDelayMax(int32_t* maxDelayMs  __unused) {
++ndk::ScopedAStatus Vibrator::getCompositionDelayMax(int32_t* /* maxDelayMs */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::getCompositionSizeMax(int32_t* maxSize __unused) {
++ndk::ScopedAStatus Vibrator::getCompositionSizeMax(int32_t* /* maxSize */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::getSupportedPrimitives(std::vector<CompositePrimitive>* supported __unused) {
++ndk::ScopedAStatus Vibrator::getSupportedPrimitives(
++        std::vector<CompositePrimitive>* /* supported */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::getPrimitiveDuration(CompositePrimitive primitive __unused,
+-                                                  int32_t* durationMs __unused) {
++ndk::ScopedAStatus Vibrator::getPrimitiveDuration(
++        CompositePrimitive /* primitive */, int32_t* /* durationMs */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::compose(const std::vector<CompositeEffect>& composite __unused,
+-                                     const std::shared_ptr<IVibratorCallback>& callback __unused) {
++ndk::ScopedAStatus Vibrator::compose(
++        const std::vector<CompositeEffect>& /* composite */,
++        const std::shared_ptr<IVibratorCallback>& /* callback */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::getSupportedAlwaysOnEffects(std::vector<Effect>* _aidl_return __unused) {
++ndk::ScopedAStatus Vibrator::getSupportedAlwaysOnEffects(
++        std::vector<Effect>* /* _aidl_return */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::alwaysOnEnable(int32_t id __unused, Effect effect __unused,
+-                                            EffectStrength strength __unused) {
++ndk::ScopedAStatus Vibrator::alwaysOnEnable(
++        int32_t /* id */, Effect /* effect */, EffectStrength /* strength */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-ndk::ScopedAStatus Vibrator::alwaysOnDisable(int32_t id __unused) {
++ndk::ScopedAStatus Vibrator::alwaysOnDisable(int32_t /* id */) {
+     return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+ }
+ 
+-}  // namespace vibrator
+-}  // namespace hardware
+-}  // namespace android
+-}  // namespace aidl
++}  // namespace aidl::android::hardware::vibrator
+diff --git a/Vibrator.h b/Vibrator.h
+index 3541836..2a67414 100644
+--- a/Vibrator.h
++++ b/Vibrator.h
+@@ -25,59 +25,73 @@
+  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * RodinHaptics modifications Copyright (c) 2026 NEESCHAL.
+  */
+ 
+ #pragma once
+ 
+ #include <aidl/android/hardware/vibrator/BnVibrator.h>
+ 
+-namespace aidl {
+-namespace android {
+-namespace hardware {
+-namespace vibrator {
++#include <cstdint>
++
++namespace aidl::android::hardware::vibrator {
+ 
+ class InputFFDevice {
+ public:
+     InputFFDevice();
+-    int playEffect(int effectId, EffectStrength es, long *playLengthMs);
++
++    int playEffect(int effectId, EffectStrength strength, long* playLengthMs);
+     int on(int32_t timeoutMs);
+     int off();
+     int setAmplitude(uint8_t amplitude);
++
+     bool mSupportGain;
+     bool mSupportEffects;
++
+ private:
+-    int play(int effectId, uint32_t timeoutMs, long *playLengthMs);
++    int play(int effectId, uint32_t timeoutMs, long* playLengthMs);
++    int writeGain(int32_t magnitude);
++
+     int mVibraFd;
+     int16_t mCurrAppId;
+-    int16_t mCurrMagnitude;
++    int32_t mCurrMagnitude;
++
++    // Short UI waveforms are translated to native si_haptic effects. Android's
++    // first amplitude update selects the strength; later points in the same
++    // waveform are ignored to preserve the actuator's crisp native texture.
++    bool mUiPulseMode;
++    bool mUiAmplitudeLatched;
++    int32_t mUiBaseMagnitude;
+ };
+ 
+ class Vibrator : public BnVibrator {
+ public:
+-    class InputFFDevice ff;
++    InputFFDevice ff;
++
+     ndk::ScopedAStatus getCapabilities(int32_t* _aidl_return) override;
+     ndk::ScopedAStatus off() override;
+     ndk::ScopedAStatus on(int32_t timeoutMs,
+-            const std::shared_ptr<IVibratorCallback>& callback) override;
++                          const std::shared_ptr<IVibratorCallback>& callback) override;
+     ndk::ScopedAStatus perform(Effect effect, EffectStrength strength,
+-            const std::shared_ptr<IVibratorCallback>& callback,
+-            int32_t* _aidl_return) override;
++                               const std::shared_ptr<IVibratorCallback>& callback,
++                               int32_t* _aidl_return) override;
+     ndk::ScopedAStatus getSupportedEffects(std::vector<Effect>* _aidl_return) override;
+     ndk::ScopedAStatus setAmplitude(float amplitude) override;
+     ndk::ScopedAStatus setExternalControl(bool enabled) override;
+-    ndk::ScopedAStatus getCompositionDelayMax(int32_t* maxDelayMs);
+-    ndk::ScopedAStatus getCompositionSizeMax(int32_t* maxSize);
+-    ndk::ScopedAStatus getSupportedPrimitives(std::vector<CompositePrimitive>* supported) override;
++    ndk::ScopedAStatus getCompositionDelayMax(int32_t* maxDelayMs) override;
++    ndk::ScopedAStatus getCompositionSizeMax(int32_t* maxSize) override;
++    ndk::ScopedAStatus getSupportedPrimitives(
++            std::vector<CompositePrimitive>* supported) override;
+     ndk::ScopedAStatus getPrimitiveDuration(CompositePrimitive primitive,
+                                             int32_t* durationMs) override;
+     ndk::ScopedAStatus compose(const std::vector<CompositeEffect>& composite,
+                                const std::shared_ptr<IVibratorCallback>& callback) override;
+-    ndk::ScopedAStatus getSupportedAlwaysOnEffects(std::vector<Effect>* _aidl_return) override;
+-    ndk::ScopedAStatus alwaysOnEnable(int32_t id, Effect effect, EffectStrength strength) override;
++    ndk::ScopedAStatus getSupportedAlwaysOnEffects(
++            std::vector<Effect>* _aidl_return) override;
++    ndk::ScopedAStatus alwaysOnEnable(int32_t id, Effect effect,
++                                      EffectStrength strength) override;
+     ndk::ScopedAStatus alwaysOnDisable(int32_t id) override;
+ };
+ 
+-}  // namespace vibrator
+-}  // namespace hardware
+-}  // namespace android
+-}  // namespace aidl
++}  // namespace aidl::android::hardware::vibrator
+diff --git a/service.cpp b/service.cpp
+index 4fe3118..55458a2 100644
+--- a/service.cpp
++++ b/service.cpp
+@@ -25,26 +25,32 @@
+  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * RodinHaptics modifications Copyright (c) 2026 NEESCHAL.
+  */
+ 
+-#define LOG_TAG "vendor.qti.hardware.vibrator.service"
+-
+ #include <android-base/logging.h>
+ #include <android/binder_manager.h>
+ #include <android/binder_process.h>
+ 
++#include <cstdlib>
++#include <memory>
++#include <string>
++
+ #include "Vibrator.h"
+ 
+ using aidl::android::hardware::vibrator::Vibrator;
+ 
+ int main() {
+     ABinderProcess_setThreadPoolMaxThreadCount(0);
+-    std::shared_ptr<Vibrator> vib = ndk::SharedRefBase::make<Vibrator>();
+ 
+-    const std::string instance = std::string() + Vibrator::descriptor + "/default";
+-    binder_status_t status = AServiceManager_addService(vib->asBinder().get(), instance.c_str());
+-    CHECK(status == STATUS_OK);
++    const std::shared_ptr<Vibrator> vibrator = ndk::SharedRefBase::make<Vibrator>();
++    const std::string instance = std::string(Vibrator::descriptor) + "/default";
++
++    const binder_status_t status =
++            AServiceManager_addService(vibrator->asBinder().get(), instance.c_str());
++    CHECK(status == STATUS_OK) << "Failed to register " << instance;
+ 
+     ABinderProcess_joinThreadPool();
+-    return EXIT_FAILURE;  // should not reach
++    return EXIT_FAILURE;  // Unreachable during normal service operation.
+ }
