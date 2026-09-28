@@ -14,4 +14,4 @@ b2978382bfab48c166337c9abf22fdcdb1de5e65c93e21bd51d50633dcf44bad  ./docs/VALIDAT
 4ebdcb590680faab81a2f985ddf9b4d0eb3349e25e69fd84bc90d568c2666eb9  ./patches/vendor-base-to-RodinHaptics.patch
 4792c16206602ef96b4be135effcc0915fcb94aa72b11cb9483287350356fdbf  ./service.cpp
 92c19ea5cd40cba93772a95ebe5b43199b4a9911d958ae17bea02adc00ab95fb  ./vendor.qti.hardware.vibrator.service.rodin.rc
-dc54b323b6958ef58ed41e3b5559b7985575dc8f79d7e807f63f7e8b1ea53832  ./vendor.qti.hardware.vibrator.service.rodin.xml
+5cf94ad6bd7b78b2020874fd6fc74764447f2cd9fddb8ef5288eb13619d42aba  ./vendor.qti.hardware.vibrator.service.rodin.xml
