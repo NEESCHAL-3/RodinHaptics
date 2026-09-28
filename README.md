@@ -213,9 +213,6 @@ init/VINTF wiring and SELinux policy remain consistent.
 BSD-3-Clause. Original The Linux Foundation notices are preserved in derived
 source files. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-## Maintainer
-
-**NEESCHAL**
 
 ## Taking RodinHaptics Further
 
